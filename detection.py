@@ -5,7 +5,6 @@
 
 import cv2, mediapipe as mp, numpy as np, math, time, pygame
 
-# ========== CONFIG (tuning) ==========
 CAM_INDEX = 0
 FRAME_WIDTH = 640
 DRAW_MESH = False
