@@ -1,49 +1,43 @@
-# facemesh_gaze_headpose_alarm_tuned.py
-# Versi tuned: smoothing yaw benar, frame-based trigger konsisten (berdasarkan FPS),
-# hapus immediate short-frame trigger, outlier rejection sederhana.
-# Requirements: mediapipe opencv-python pygame numpy
+# facemesh_ear_headpose_alarm_tuned.py
+# Versi tuned: HAPUS IRIS, GANTI DENGAN EAR (EYE ASPECT RATIO) UNTUK DETEKSI MENGANTUK
+# Hybrid FaceMesh + Pose untuk deteksi head turn ekstrem via telinga
+# Requirements: mediapipe>=0.10, opencv-python, pygame, numpy
 
 import cv2, mediapipe as mp, numpy as np, math, time, pygame
 
 CAM_INDEX = 0
 FRAME_WIDTH = 640
 DRAW_MESH = False
-SMOOTH_ALPHA = 0.5
 SMOOTH_YAW_ALPHA = 0.5  
 
-MAX_GAZE_DELTA = 0.15 
-
-LEFT_THRESH = 0.35
-RIGHT_THRESH = 0.65
-UP_THRESH = 0.35
-DOWN_THRESH = 0.65
-
+# --- EAR Threshold ---
+EAR_THRESHOLD = 0.25  # Jika EAR < 0.25 → mata tertutup
+EAR_CONSEC_FRAMES = 10  # Jumlah frame berturut-turut mata tertutup sebelum trigger alarm
 
 ALARM_FILE = "danger_alarm.wav"
-ALARM_DELAY = 1.0     
-COOLDOWN = 1.0
+ALARM_DELAY = 3.0     
+COOLDOWN = 3.0
 VOLUME = 0.9
 
 ON_OFF_FRAMES_THRESHOLD = 5
-
-
 YAW_HEAD_TURN_THRESH = 18.0   
-ALARM_MODE = "either" # or "both"
+ALARM_MODE = "either"  # or "both"
 
 # ====================================
 
 mp_face_mesh = mp.solutions.face_mesh
+mp_pose = mp.solutions.pose
 mp_drawing = mp.solutions.drawing_utils
 mp_drawing_styles = mp.solutions.drawing_styles
 
-LEFT_IRIS = [474,475,476,477]
-RIGHT_IRIS = [469,470,471,472]
-LEFT_EYE = [362,263,387,373,380,385]
-RIGHT_EYE = [33,133,159,145,153,144]
+# Landmark mata untuk EAR (Eye Aspect Ratio)
+LEFT_EYE = [362,263,387,373,380,385]  # left eye landmarks
+RIGHT_EYE = [33,133,159,145,153,144]  # right eye landmarks
 PNP_INDICES = [1,152,33,263,61,291]
 
 face_mesh = mp_face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True,
                                  min_detection_confidence=0.5, min_tracking_confidence=0.5)
+pose = mp_pose.Pose(static_image_mode=False, min_detection_confidence=0.5, min_tracking_confidence=0.5)
 
 pygame.mixer.init()
 pygame.mixer.music.load(ALARM_FILE)
@@ -52,9 +46,7 @@ pygame.mixer.music.set_volume(VOLUME)
 cap = cv2.VideoCapture(CAM_INDEX)
 
 # states
-ema_l = ema_r = ema_v_l = ema_v_r = None
 ema_yaw = None
-prev_gaze = None
 prev_time = None
 offcenter_frames = 0
 offcenter_start = None
@@ -62,22 +54,31 @@ last_alarm_time = -9999
 fps_smoothed = 30.0
 fps_alpha = 0.08
 
+# EAR states
+eye_closed_frames = 0
+prev_ear = None
+
 def ema(prev, value, alpha):
     return value if prev is None else prev*(1-alpha) + value*alpha
 
-def centroid_px(landmarks,w,h):
-    xs=[p.x for p in landmarks]; ys=[p.y for p in landmarks]
-    return int(sum(xs)/len(xs)*w), int(sum(ys)/len(ys)*h)
-
-def calc_relative(iris_x, eye_xs):
-    mn=min(eye_xs); mx=max(eye_xs); width=mx-mn
-    if width<=1e-3: return 0.5
-    return (iris_x - mn)/width
-
-def calc_relative_y(iris_y, eye_ys):
-    mn=min(eye_ys); mx=max(eye_ys); height=mx-mn
-    if height<=1e-3: return 0.5
-    return (iris_y - mn)/height
+def calc_ear(eye_landmarks, w, h):
+    """Hitung Eye Aspect Ratio (EAR) dari 6 titik mata"""
+    # Ambil koordinat titik-titik mata
+    x = [lm.x * w for lm in eye_landmarks]
+    y = [lm.y * h for lm in eye_landmarks]
+    
+    # Hitung jarak vertikal (A dan B)
+    A = math.dist((x[1], y[1]), (x[5], y[5]))  # atas-bawah
+    B = math.dist((x[2], y[2]), (x[4], y[4]))  # atas-bawah
+    
+    # Hitung jarak horizontal (C)
+    C = math.dist((x[0], y[0]), (x[3], y[3]))  # kiri-kanan
+    
+    if C == 0:
+        return 0.0
+    
+    ear = (A + B) / (2.0 * C)
+    return ear
 
 def solve_head_pose(lm_list,w,h):
     model_points = np.array([(0.0,0.0,0.0),(0.0,-63.6,-12.5),
@@ -105,112 +106,141 @@ def solve_head_pose(lm_list,w,h):
         roll = 0.0
     return yaw, pitch, roll
 
+def detect_head_turn_from_pose(pose_landmarks, w, h):
+    """Estimasi kasar head turn dari posisi hidung dan telinga"""
+    nose = pose_landmarks.landmark[0]
+    ear_left = pose_landmarks.landmark[8]   # left ear
+    ear_right = pose_landmarks.landmark[7]  # right ear
+
+    nose_x = nose.x * w
+    ear_left_x = ear_left.x * w
+    ear_right_x = ear_right.x * w
+
+    ear_mid_x = (ear_left_x + ear_right_x) / 2.0
+    offset = nose_x - ear_mid_x
+    ear_dist = abs(ear_right_x - ear_left_x)
+
+    if ear_dist < 10:
+        return False, 0.0
+
+    normalized_offset = offset / ear_dist
+
+    if abs(normalized_offset) > 0.3:
+        return True, normalized_offset
+    return False, normalized_offset
+
 try:
     while True:
         t0 = time.time()
         ret, frame = cap.read()
         if not ret: break
+
         # FPS smoothing
         if prev_time is None: prev_time = t0
         dt = t0 - prev_time if prev_time else 1/30.0
         prev_time = t0
         inst_fps = 1.0/dt if dt>0 else 30.0
         fps_smoothed = ema(fps_smoothed, inst_fps, fps_alpha)
-        # processing
-        h0,w0 = frame.shape[:2]; scale = FRAME_WIDTH/float(w0)
-        frame = cv2.resize(frame,(FRAME_WIDTH,int(h0*scale))); h,w = frame.shape[:2]
-        frame = cv2.flip(frame,1); rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = face_mesh.process(rgb)
 
-        face_present=False; center_state=True; gaze_x=gaze_y=None; head_yaw=head_pitch=head_roll=None
+        # Resize & flip
+        h0,w0 = frame.shape[:2]
+        scale = FRAME_WIDTH/float(w0)
+        frame = cv2.resize(frame, (FRAME_WIDTH, int(h0*scale)))
+        h, w = frame.shape[:2]
+        frame = cv2.flip(frame, 1)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-        if results.multi_face_landmarks:
-            face_present=True
-            lm_list = results.multi_face_landmarks[0].landmark
+        # Proses FaceMesh
+        face_results = face_mesh.process(rgb)
+        pose_results = pose.process(rgb)
+
+        face_present = False
+        center_state = True
+        head_yaw = head_pitch = head_roll = None
+        head_turn = False
+        eye_open = True  # default: mata terbuka
+        ear_avg = None
+
+        # --- Mode 1: FaceMesh aktif ---
+        if face_results.multi_face_landmarks:
+            face_present = True
+            lm_list = face_results.multi_face_landmarks[0].landmark
+
             if DRAW_MESH:
-                mp_drawing.draw_landmarks(image=frame, landmark_list=results.multi_face_landmarks[0],
-                                          connections=mp_face_mesh.FACEMESH_TESSELATION,
-                                          landmark_drawing_spec=None,
-                                          connection_drawing_spec=mp_drawing_styles.get_default_face_mesh_tesselation_style())
-            # iris centers
-            lx,ly = centroid_px([lm_list[i] for i in LEFT_IRIS], w, h)
-            rx,ry = centroid_px([lm_list[i] for i in RIGHT_IRIS], w, h)
-            # eye boxes
-            left_eye_xs = [lm_list[i].x*w for i in LEFT_EYE]; left_eye_ys = [lm_list[i].y*h for i in LEFT_EYE]
-            right_eye_xs = [lm_list[i].x*w for i in RIGHT_EYE]; right_eye_ys = [lm_list[i].y*h for i in RIGHT_EYE]
-            # draw
-            cv2.circle(frame,(lx,ly),2,(0,255,0),-1); cv2.circle(frame,(rx,ry),2,(0,255,0),-1)
+                mp_drawing.draw_landmarks(
+                    image=frame, landmark_list=face_results.multi_face_landmarks[0],
+                    connections=mp_face_mesh.FACEMESH_TESSELATION,
+                    landmark_drawing_spec=None,
+                    connection_drawing_spec=mp_drawing_styles.get_default_face_mesh_tesselation_style()
+                )
 
-            # relative gaze
-            l_rel_x=calc_relative(lx,left_eye_xs); r_rel_x=calc_relative(rx,right_eye_xs)
-            l_rel_y=calc_relative_y(ly,left_eye_ys); r_rel_y=calc_relative_y(ry,right_eye_ys)
-            cand_x = (l_rel_x + r_rel_x)/2.0; cand_y = (l_rel_y + r_rel_y)/2.0
+            # EAR: hitung untuk kiri & kanan
+            left_eye_lms = [lm_list[i] for i in LEFT_EYE]
+            right_eye_lms = [lm_list[i] for i in RIGHT_EYE]
 
-            # outlier rejection: jika perubahan besar dibanding prev_gaze, ignore update once
-            reject = False
-            if prev_gaze is not None:
-                if abs(cand_x - prev_gaze[0]) > MAX_GAZE_DELTA or abs(cand_y - prev_gaze[1]) > MAX_GAZE_DELTA:
-                    reject = True
+            ear_left = calc_ear(left_eye_lms, w, h)
+            ear_right = calc_ear(right_eye_lms, w, h)
+            ear_avg = (ear_left + ear_right) / 2.0
 
-            if not reject:
-                ema_l = ema(ema_l, l_rel_x, SMOOTH_ALPHA); ema_r = ema(ema_r, r_rel_x, SMOOTH_ALPHA)
-                ema_v_l = ema(ema_v_l, l_rel_y, SMOOTH_ALPHA); ema_v_r = ema(ema_v_r, r_rel_y, SMOOTH_ALPHA)
-                gaze_x = (ema_l + ema_r)/2.0; gaze_y = (ema_v_l + ema_v_r)/2.0
-                prev_gaze = (gaze_x, gaze_y)
+            # Tentukan apakah mata tertutup
+            if ear_avg < EAR_THRESHOLD:
+                eye_open = False
+                eye_closed_frames += 1
             else:
-                gaze_x, gaze_y = prev_gaze if prev_gaze is not None else (0.5,0.5)
+                eye_open = True
+                eye_closed_frames = 0
 
-            # head pose
+            # Head pose
             hp = solve_head_pose(lm_list, w, h)
             if hp is not None:
-                yaw,pitch,roll = hp
-                ema_yaw = ema(ema_yaw, yaw, SMOOTH_YAW_ALPHA) if 'ema_yaw' in globals() and ema_yaw is not None else yaw
-                # ensure global ema_yaw exists
-                globals()['ema_yaw'] = ema_yaw
+                yaw, pitch, roll = hp
+                ema_yaw = ema(ema_yaw, yaw, SMOOTH_YAW_ALPHA) if ema_yaw is not None else yaw
                 head_yaw = ema_yaw; head_pitch = pitch; head_roll = roll
 
-            # gaze-> status
-            horiz = vert = "CENTER"
-            if gaze_x is not None:
-                if gaze_x < LEFT_THRESH: horiz = "LEFT"
-                elif gaze_x > RIGHT_THRESH: horiz = "RIGHT"
-                if gaze_y < UP_THRESH: vert = "UP"
-                elif gaze_y > DOWN_THRESH: vert = "DOWN"
-
-            # head-turn boolean using smoothed head_yaw
-            head_turn = False
             if head_yaw is not None and abs(head_yaw) > YAW_HEAD_TURN_THRESH:
                 head_turn = True
 
-            # decide offcenter flag based on ALARM_MODE
-            gaze_center = (horiz=="CENTER" or vert=="CENTER")
-            if ALARM_MODE == "either":
-                offcenter_flag = (not gaze_center) or head_turn
-            else: # "both"
-                offcenter_flag = (not gaze_center) and head_turn
+        # --- Mode 2: FaceMesh TIDAK aktif, tapi Pose aktif ---
+        elif pose_results.pose_landmarks:
+            face_present = True
+            head_turn_fallback, offset = detect_head_turn_from_pose(pose_results.pose_landmarks, w, h)
+            head_turn = head_turn_fallback
+            eye_open = True  # anggap mata terbuka jika wajah tidak terlihat
 
-            center_state = not offcenter_flag
+        # --- Tentukan offcenter flag ---
+        # Jika mata tertutup TERLALU LAMA atau kepala menoleh → offcenter
+        eye_closed_long = eye_closed_frames >= EAR_CONSEC_FRAMES
+        if ALARM_MODE == "either":
+            offcenter_flag = eye_closed_long or head_turn
+        else:  # "both"
+            offcenter_flag = eye_closed_long and head_turn
 
-            # overlays
-            cv2.putText(frame, f"GazeX:{gaze_x:.2f} GazeY:{gaze_y:.2f}", (10,30), cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,255,0),2)
+        center_state = not offcenter_flag
+
+        # --- Overlay visual ---
+        if face_results.multi_face_landmarks or pose_results.pose_landmarks:
+            if ear_avg is not None:
+                cv2.putText(frame, f"EAR:{ear_avg:.3f}", (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+            else:
+                cv2.putText(frame, "EAR: N/A", (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+
             if head_yaw is not None:
-                cv2.putText(frame, f"Yaw:{head_yaw:.1f} Pitch:{head_pitch:.1f} Roll:{head_roll:.1f}", (10,60), cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,255,255),2)
-            status = ("HEAD TURN" if head_turn else f"{horiz}/{vert}")
-            cv2.putText(frame, f"Status:{status}", (10,h-20), cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,200,255),2)
+                cv2.putText(frame, f"Yaw:{head_yaw:.1f} Pitch:{head_pitch:.1f} Roll:{head_roll:.1f}",
+                            (10,60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
 
-        # ---- Frame-based trigger using FPS-derived frames_needed ----
+            status = "HEAD TURN (Pose)" if (not face_results.multi_face_landmarks and head_turn) else \
+                     ("HEAD TURN" if head_turn else ("EYES CLOSED" if not eye_open else "EYES OPEN"))
+            cv2.putText(frame, f"Status:{status}", (10, h-20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,200,255), 2)
+
+        # --- Alarm logic ---
         now = time.time()
-        # update offcenter_frames
         if face_present and not center_state:
             offcenter_frames += 1
         else:
             offcenter_frames = 0
             offcenter_start = None
 
-        # compute frames needed from ALARM_DELAY and fps_smoothed
         frames_needed = 15
-
-        # only start timer after ON_OFF_FRAMES_THRESHOLD consecutive off frames (debounce)
         if offcenter_frames >= ON_OFF_FRAMES_THRESHOLD and offcenter_start is None:
             offcenter_start = now
 
@@ -218,19 +248,20 @@ try:
         alarm_playing = pygame.mixer.music.get_busy()
         time_since_last = now - last_alarm_time
 
-        # trigger only if offcenter_frames >= frames_needed AND elapsed >= ALARM_DELAY
-        if offcenter_frames >= frames_needed and elapsed >= ALARM_DELAY and not alarm_playing and (time_since_last > COOLDOWN):
+        if (offcenter_frames >= frames_needed and elapsed >= ALARM_DELAY and
+            not alarm_playing and (time_since_last > COOLDOWN)):
             pygame.mixer.music.play()
             last_alarm_time = now
-            print("Alarm triggered at", time.strftime("%H:%M:%S"), f"(frames={offcenter_frames}, frames_needed={frames_needed}, elapsed={elapsed:.2f}s)")
+            print("Alarm triggered at", time.strftime("%H:%M:%S"),
+                  f"(frames={offcenter_frames}, frames_needed={frames_needed}, elapsed={elapsed:.2f}s)")
 
-        # display fps
+        # --- FPS display ---
         cur = time.time()
         inst_fps = 1.0 / (cur - prev_time) if prev_time else fps_smoothed
         prev_time = cur
-        cv2.putText(frame, f"FPS:{fps_smoothed:.1f}", (w-120,30), cv2.FONT_HERSHEY_SIMPLEX,0.6,(255,255,255),1)
+        cv2.putText(frame, f"FPS:{fps_smoothed:.1f}", (w-120,30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
 
-        cv2.imshow("Tuned FaceMesh+Gaze+HeadPose+Alarm", frame)
+        cv2.imshow("Tuned FaceMesh+EAR+HeadPose+Alarm", frame)
         key = cv2.waitKey(1) & 0xFF
         if key == 27 or key == ord('q'): break
         if key == ord('m'): DRAW_MESH = not DRAW_MESH
@@ -238,6 +269,11 @@ try:
             if pygame.mixer.music.get_busy(): pygame.mixer.music.stop()
 
 finally:
-    cap.release(); cv2.destroyAllWindows(); face_mesh.close()
-    try: pygame.mixer.music.stop(); pygame.mixer.quit()
+    cap.release()
+    cv2.destroyAllWindows()
+    face_mesh.close()
+    pose.close()
+    try:
+        pygame.mixer.music.stop()
+        pygame.mixer.quit()
     except: pass
